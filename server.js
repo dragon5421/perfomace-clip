@@ -11,6 +11,7 @@
 
 import express from "express";
 import { spawn } from "child_process";
+import fs from "fs";
 
 const app = express();
 app.use(express.json());
@@ -79,6 +80,25 @@ function httpErr(status, message) { const e = new Error(message); e.status = sta
 const sanitize = s => String(s || "clip").replace(/[^\w\-]+/g, "_").slice(0, 80);
 
 // ---------------- YouTube (yt-dlp) ----------------
+// Optional: YOUTUBE_COOKIES holds the contents of a Netscape-format cookies.txt
+// exported from a browser logged into YouTube. This is the reliable way past
+// YouTube's datacenter-IP bot blocking, but note the tradeoffs:
+//   - it puts an authenticated session on the server
+//   - cookies expire and need re-exporting periodically
+//   - Google may flag an account whose session is used from a datacenter
+// Prefer a throwaway/secondary Google account over your main school account.
+let COOKIE_FILE = null;
+if (process.env.YOUTUBE_COOKIES) {
+  try {
+    COOKIE_FILE = "/tmp/yt-cookies.txt";
+    fs.writeFileSync(COOKIE_FILE, process.env.YOUTUBE_COOKIES);
+    console.log("YouTube cookies loaded — will be used as a fallback if client spoofing fails.");
+  } catch (e) {
+    console.warn("Couldn't write the YouTube cookie file:", e.message);
+    COOKIE_FILE = null;
+  }
+}
+
 // YouTube has no API that returns a downloadable file URL, so we use yt-dlp to
 // resolve a direct stream URL that ffmpeg can range-seek — same shape as the
 // Vimeo path, different resolver.
@@ -113,21 +133,63 @@ function ytdlp(args, timeoutMs = 45000) {
 async function resolveYouTube(videoId, maxHeight) {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const cap = maxHeight || 1080;
-  // Prefer a single pre-merged MP4 (simplest, one input, guaranteed A/V).
-  // Fall back to separate best-video + best-audio, which ffmpeg will mux.
   const fmt = `best[ext=mp4][height<=${cap}][acodec!=none][vcodec!=none]/` +
               `bestvideo[ext=mp4][height<=${cap}]+bestaudio[ext=m4a]/` +
               `best[height<=${cap}]`;
-  // -O prints one line per resolved stream: 1 line = merged, 2 lines = video+audio
-  const raw = await ytdlp(["-f", fmt, "--no-playlist", "--no-warnings",
-    "-O", "urls", "--print", "title", url]);
-  const lines = raw.split("\n").map(s => s.trim()).filter(Boolean);
-  if (!lines.length) throw httpErr(422, "yt-dlp returned no stream URL for that video.");
-  // The title is printed last by --print; stream URLs start with http
-  const urls = lines.filter(l => /^https?:\/\//i.test(l));
-  const title = lines.find(l => !/^https?:\/\//i.test(l)) || `youtube_${videoId}`;
-  if (!urls.length) throw httpErr(422, "yt-dlp returned no usable stream URL.");
-  return { urls, name: title };
+
+  // YouTube blocks datacenter IPs (Render/Railway/AWS) with "Sign in to confirm
+  // you're not a bot" — the default web client gets flagged. Spoofing a mobile
+  // app client usually sidesteps this for public videos, because those clients
+  // authenticate differently. We try several in order and use the first that works.
+  //
+  // If a YOUTUBE_COOKIES env var is set (Netscape cookie file contents), we also
+  // try a cookie-authenticated pass as a last resort.
+  const clients = (process.env.YT_CLIENTS || "android,ios,tv,web").split(",").map(s => s.trim()).filter(Boolean);
+
+  const attempts = [];
+  for (const c of clients) {
+    attempts.push({
+      label: `client=${c}`,
+      args: ["-f", fmt, "--no-playlist", "--no-warnings",
+             "--extractor-args", `youtube:player_client=${c}`,
+             "-O", "urls", "--print", "title", url],
+    });
+  }
+  if (COOKIE_FILE) {
+    attempts.push({
+      label: "cookies",
+      args: ["-f", fmt, "--no-playlist", "--no-warnings",
+             "--cookies", COOKIE_FILE,
+             "-O", "urls", "--print", "title", url],
+    });
+  }
+
+  const errors = [];
+  for (const a of attempts) {
+    try {
+      const raw = await ytdlp(a.args);
+      const lines = raw.split("\n").map(s => s.trim()).filter(Boolean);
+      const urls = lines.filter(l => /^https?:\/\//i.test(l));
+      if (!urls.length) { errors.push(`${a.label}: no stream URL`); continue; }
+      const title = lines.find(l => !/^https?:\/\//i.test(l)) || `youtube_${videoId}`;
+      console.log(`YouTube ${videoId}: resolved via ${a.label}`);
+      return { urls, name: title };
+    } catch (e) {
+      errors.push(`${a.label}: ${e.message}`);
+      // keep trying the next client
+    }
+  }
+
+  // Everything failed. Give a message that says what's actually wrong.
+  const blob = errors.join(" || ");
+  if (/sign in|not a bot|consent|age/i.test(blob)) {
+    throw httpErr(429,
+      "YouTube blocked this request. Cloud servers (Render/Railway) share datacenter IPs that YouTube flags as bots — " +
+      "this is a known limitation, not a fault in the video or your setup. " +
+      "Options: set YOUTUBE_COOKIES on the backend, use a residential proxy, or host the archive on Vimeo (which has a proper API). " +
+      "Details: " + blob.slice(0, 300));
+  }
+  throw httpErr(422, "Couldn't resolve that YouTube video. " + blob.slice(0, 300));
 }
 
 function parseYouTubeId(s) {
@@ -195,6 +257,8 @@ app.get("/", (_req, res) => res.json({
   ytdlpVersion: ytdlpVersion || "not installed",
   ytdlpAgeDays: ytdlpVersion ? Math.round(ytdlpAgeDays(ytdlpVersion)) : null,
   autoUpdate: AUTO_UPDATE,
+  ytCookies: !!COOKIE_FILE,
+  ytClients: (process.env.YT_CLIENTS || "android,ios,tv,web"),
 }));
 
 // ---- main endpoint ----
