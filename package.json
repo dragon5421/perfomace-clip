@@ -1,8 +1,8 @@
 {
   "name": "clip-backend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
-  "description": "Vimeo clip cutting worker (ffmpeg range-seek)",
+  "description": "Vimeo clip cutting worker (ffmpeg range-seek). Deploys to Render or Railway.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

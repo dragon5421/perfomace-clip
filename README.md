@@ -1,94 +1,118 @@
-# Performance Clip Tool — Backend (Railway)
+# Performance Clip Tool — Backend
 
-Cuts clips out of your Vimeo videos using the Vimeo API + ffmpeg, reading only
-the bytes around each clip (HTTP range-seek) so it never downloads the full
-video. Pairs with the Netlify frontend.
+Cuts clips from Vimeo videos using the Vimeo API + ffmpeg. Reads only the bytes
+around each clip via HTTP range-seek, so a 90-second cut from a 2-hour file
+transfers a few MB — never the whole video.
+
+Deploys **identically to Render or Railway**. Same repo, same Dockerfile, no
+code changes. You can run both and switch between them in the frontend.
+
+---
+
+## Repo layout
+
+These files must be at the **root of the repo** (not nested in a subfolder), or
+the platform won't find the Dockerfile:
+
+```
+server.js
+package.json
+package-lock.json
+Dockerfile
+.dockerignore
+.gitignore
+```
 
 ---
 
-## What you need first: a Vimeo API token
+## Environment variables
 
-1. Go to **developer.vimeo.com/apps** → **Create an app** (any name).
-2. In the app, go to **Authentication** → generate a **Personal Access Token**.
-3. Give it the scopes: **Public**, **Private**, and **Video Files**.
-   - The `Video Files` scope is the important one — it's what returns
-     downloadable file links.
-   - ⚠ On some lower Vimeo plan tiers the API won't return file links even with
-     this scope. If you get a "No progressive file" error, that's the cause —
-     you'd need a Vimeo plan that allows API file access.
-4. Copy the token. You'll paste it into Railway as `VIMEO_TOKEN`.
+| Key | Value |
+|---|---|
+| `VIMEO_TOKEN` | Vimeo personal access token — scopes: **Public**, **Private**, **Video Files** |
+| `ALLOWED_ORIGIN` | Your frontend origin, e.g. `https://performanceclips.netlify.app` |
 
-You must be the **owner** of the videos (or the account) for the token to
-access their files.
+Don't set `PORT` — both platforms inject it automatically.
+
+`ALLOWED_ORIGIN` tolerates a trailing slash, and accepts a comma-separated list.
+`*` allows any origin (fine for testing; lock it down for real use).
+
+### Getting the Vimeo token
+1. developer.vimeo.com/apps → **Create an app**
+2. **Authentication** → generate a **Personal Access Token**
+3. Tick scopes: Public, Private, **Video Files** ← the important one
+4. You must own the videos (or the account) for the token to reach their files.
+
+⚠ Some lower Vimeo plan tiers don't expose downloadable files via API even with
+the right scope. If you see "No progressive file for this video," that's the
+cause, not a bug.
 
 ---
+
+## Deploy to Render (free tier)
+
+1. dashboard.render.com → **New +** → **Web Service**
+2. Connect the GitHub repo.
+3. Settings:
+   - **Root Directory:** blank (files are at repo root)
+   - **Runtime/Language:** **Docker** ← must be Docker, not Node. The Dockerfile
+     is what installs ffmpeg; without it every cut fails.
+   - **Instance Type:** **Free**
+   - Leave build/start commands blank — the Dockerfile handles them.
+4. Add the two environment variables above.
+5. **Create Web Service.** First build takes a few minutes (installing ffmpeg).
+
+**Free tier note:** the service sleeps after 15 minutes idle and takes 30–60s to
+wake. The frontend pings it automatically when you load a video, so it's warm by
+the time you cut.
 
 ## Deploy to Railway
 
-1. Push this `clip-backend` folder to a GitHub repo (or use Railway's CLI).
-2. In Railway: **New Project → Deploy from GitHub repo** → pick it.
-   - Railway auto-detects the **Dockerfile** (which installs ffmpeg). No build
-     config needed.
-3. Add environment variables in the Railway project **Variables** tab:
-   - `VIMEO_TOKEN` = your token from above
-   - `ALLOWED_ORIGIN` = your Netlify site URL, e.g.
-     `https://your-clip-tool.netlify.app`
-     (comma-separate multiple; `*` allows any origin — fine for testing, lock
-     it down for real use)
-4. Deploy. Railway gives you a public URL like
-   `https://your-app.up.railway.app`.
-5. Open `https://your-app.up.railway.app/` in a browser — you should see
-   `{"ok":true,...,"tokenSet":true}`.
-
-Paste that Railway URL into the **Backend URL** field on the Netlify frontend.
-Done.
+New Project → Deploy from GitHub repo → pick it. Railway auto-detects the
+Dockerfile. Add the same two variables. Railway has no permanent free tier
+($5 trial credit, then $5/mo Hobby).
 
 ---
 
-## How the cutting works
+## Verify
 
-- Frontend sends `{ videoId, hash, in, out, name, mode }`.
-- Backend asks Vimeo for the video's `progressive` MP4 link (a temporary CDN
-  URL).
-- ffmpeg runs `-ss <in> -i <cdn-url> -t <len> ...` — putting `-ss` **before**
-  `-i` makes ffmpeg seek into the remote file with range requests, pulling only
-  the bytes near your clip. A 90-second cut from a 2-hour file transfers a few
-  MB, not gigabytes.
-- The cut MP4 streams straight back to the browser as a download.
+Open the service root URL in a browser:
 
-**Modes:**
-- `fast` (default) — stream-copy, no re-encode. Near-instant. Snaps the start
-  to the nearest keyframe (typically within a few hundred ms).
-- `accurate` — re-encodes (H.264/AAC) for a frame-exact start. Slower, heavier
-  on the server, but precise.
+```
+https://your-app.onrender.com/
+```
+
+Expect: `{"ok":true,"service":"clip-backend","tokenSet":true}`
+
+`tokenSet:false` means `VIMEO_TOKEN` didn't take.
+
+Then paste that URL into the frontend's backend dropdown → **Add**.
 
 ---
 
 ## Endpoint
 
 ```
-GET  /                 → health check
-POST /clip             → cut a clip, returns video/mp4
-     body: { videoId, hash?, in, out, name?, maxHeight?, mode? }
+GET  /       → health check (also used to wake the server)
+POST /clip   → returns video/mp4
+     { videoId, hash?, in, out, name?, maxHeight?, mode? }
 ```
 
-`maxHeight` (optional) caps the rendition, e.g. `720` to avoid pulling 1080p.
+- `hash` — the privacy hash for unlisted videos (`vimeo.com/123456789/abcdef` → `abcdef`)
+- `mode` — `fast` (default; stream-copy, near-instant, snaps to nearest keyframe)
+  or `accurate` (re-encode, frame-exact, slower)
+- `maxHeight` — optional cap, e.g. `720`
+- Per-clip limit: 30 min (adjustable in `server.js`)
 
 ---
 
-## Cost / limits
+## How it works
 
-- Railway's free tier covers light use comfortably; range-seek keeps bandwidth
-  and CPU low. `accurate` mode uses real CPU per second of clip — fine for a
-  classroom, watch it if you batch hundreds.
-- Vimeo's CDN file links expire after a few hours, but the backend fetches a
-  fresh one on every request, so that's transparent to you.
-- Per-clip cap is 30 min (adjustable in `server.js`).
+`-ss` goes **before** `-i`, which makes ffmpeg seek into the remote CDN URL with
+HTTP range requests instead of downloading the file. Vimeo's CDN supports ranges,
+so only the bytes near the clip ever move. The cut MP4 streams straight back to
+the browser.
 
----
-
-## Security note
-
-The Vimeo token lives only in Railway's environment — it's never sent to the
-browser. Keep `ALLOWED_ORIGIN` set to your real site so other pages can't call
-your backend and burn your Vimeo quota.
+Response headers are deliberately deferred until ffmpeg emits its first byte —
+otherwise an error would arrive with `Content-Type: video/mp4` already set and
+surface in the browser as an opaque CORS failure instead of a readable message.

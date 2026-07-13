@@ -2,6 +2,12 @@
 // Resolves a Vimeo progressive file link via the API, then cuts a clip with
 // ffmpeg using HTTP range-seek (reads only the bytes around in/out — no full
 // download). Streams the resulting MP4 straight back to the browser.
+//
+// Deploys identically to Render or Railway (both build the Dockerfile).
+// Env vars:
+//   VIMEO_TOKEN     — Vimeo personal access token (scopes: public private video_files)
+//   ALLOWED_ORIGIN  — your frontend origin(s), comma-separated. Trailing
+//                     slashes are tolerated. "*" allows any origin.
 
 import express from "express";
 import { spawn } from "child_process";
@@ -9,16 +15,23 @@ import { spawn } from "child_process";
 const app = express();
 app.use(express.json());
 
-// ---- CORS: lock to your Netlify site in production ----
+// ---- CORS ----
+// Trailing slashes are normalized on BOTH sides, so setting ALLOWED_ORIGIN to
+// "https://site.netlify.app/" (with slash) still matches the browser's origin
+// header "https://site.netlify.app" (without). This mismatch is a classic
+// silent killer — an origin is only ever scheme+host+port, never a path.
+const stripSlash = s => (s || "").replace(/\/+$/, "");
 const ALLOWED = (process.env.ALLOWED_ORIGIN || "*")
-  .split(",").map(s => s.trim()).filter(Boolean);
+  .split(",").map(s => stripSlash(s.trim())).filter(Boolean);
 
 // Reflect the request origin when allowed (or when "*" is configured).
 // Crucially this NEVER throws — a disallowed origin just doesn't get the
 // header, instead of producing a header-less 500 that masks the real error.
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  const allow = !ALLOWED.length || ALLOWED.includes("*") || (origin && ALLOWED.includes(origin));
+  const normOrigin = stripSlash(origin);
+  const allow = !ALLOWED.length || ALLOWED.includes("*") ||
+    (normOrigin && ALLOWED.includes(normOrigin));
   if (allow && origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
@@ -66,10 +79,12 @@ function httpErr(status, message) { const e = new Error(message); e.status = sta
 const sanitize = s => String(s || "clip").replace(/[^\w\-]+/g, "_").slice(0, 80);
 
 // ---- health check ----
+// The frontend pings this to wake sleeping free-tier servers and to confirm
+// the token is configured.
 app.get("/", (_req, res) => res.json({ ok: true, service: "clip-backend", tokenSet: !!TOKEN }));
 
 // ---- main endpoint ----
-// POST /clip { videoId, hash?, in (sec), out (sec), name?, maxHeight? }
+// POST /clip { videoId, hash?, in (sec), out (sec), name?, maxHeight?, mode? }
 app.post("/clip", async (req, res) => {
   try {
     const { videoId, hash, in: inPt, out: outPt, name, maxHeight, mode } = req.body || {};
@@ -90,8 +105,10 @@ app.post("/clip", async (req, res) => {
       ? ["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac"]
       : ["-c", "copy", "-avoid_negative_ts", "make_zero"];
 
-    // -ss before -i => ffmpeg seeks into the remote URL with range requests,
-    // reading only the bytes near the clip. movflags => streamable mp4 to stdout.
+    // -ss BEFORE -i => ffmpeg seeks into the remote URL with HTTP range
+    // requests, reading only the bytes near the clip. A 90s cut from a 2-hour
+    // file transfers a few MB, not gigabytes.
+    // movflags frag_keyframe+empty_moov => streamable mp4 to stdout (no seek-back).
     const args = [
       "-ss", String(start),
       "-i", fileUrl,
@@ -108,7 +125,8 @@ app.post("/clip", async (req, res) => {
     ff.stderr.on("data", d => { stderr += d.toString(); });
 
     // Only commit to a binary response once ffmpeg actually emits bytes.
-    // Until then, any failure can still return a readable JSON error.
+    // Until then, any failure can still return a readable JSON error — setting
+    // Content-Type early would make errors surface as opaque CORS failures.
     ff.stdout.on("data", chunk => {
       if (!started) {
         started = true;
