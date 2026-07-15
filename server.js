@@ -345,13 +345,17 @@ app.post("/clip", async (req, res) => {
     // Only commit to a binary response once ffmpeg actually emits bytes.
     // Until then, any failure can still return a readable JSON error — setting
     // Content-Type early would make errors surface as opaque CORS failures.
-    ff.stdout.on("data", chunk => {
-      if (!started) {
-        started = true;
-        res.setHeader("Content-Type", "video/mp4");
-        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-      }
-      res.write(chunk);
+    //
+    // IMPORTANT: after the first chunk we hand off to pipe() so Node's
+    // backpressure applies. A raw data->write loop ignores res.write()'s
+    // return value and buffers unboundedly when the client is slower than
+    // ffmpeg — a real OOM risk on a 512MB instance.
+    ff.stdout.once("data", firstChunk => {
+      started = true;
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.write(firstChunk);
+      ff.stdout.pipe(res);
     });
 
     ff.on("error", err => {
